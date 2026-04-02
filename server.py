@@ -1,6 +1,8 @@
 """FastAPI server exposing the phone finder pipeline via HTTP POST."""
 
+import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -18,6 +20,12 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+# Thread pool for running blocking scrape/analysis work concurrently.
+# I/O-bound work (HTTP + OpenAI) scales well beyond core count.
+# 16 cores × 2 threads/core = 32 logical CPUs → 20 threads per worker
+# gives up to 16 workers × 20 threads = 320 concurrent pipelines.
+_executor = ThreadPoolExecutor(max_workers=20)
 
 app = FastAPI(
     title="Phone Finder API",
@@ -58,18 +66,17 @@ class EmailResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 @app.post("/lookup", response_model=EmailResult)
-def lookup(request: LookupRequest) -> EmailResult:
+async def lookup(request: LookupRequest) -> EmailResult:
     """Process a single email address and return extracted phone numbers.
 
-    - Filters free/personal providers (Gmail, Outlook, etc.)
-    - Checks domain accessibility
-    - Scrapes homepage + contact pages
-    - Uses GPT-4o-mini to extract phone numbers
+    Runs the blocking scrape + OpenAI pipeline in a thread pool so the
+    server can handle multiple simultaneous requests without stalling.
     """
     if not request.email.strip():
         raise HTTPException(status_code=422, detail="Email address is required.")
 
-    return _process_single(request.email)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, _process_single, request.email)
 
 
 def _process_single(raw_email: str) -> EmailResult:
@@ -131,4 +138,4 @@ def _process_single(raw_email: str) -> EmailResult:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=57439, reload=True)
+    uvicorn.run("server:app", host="0.0.0.0", port=57439, reload=False, workers=16)
